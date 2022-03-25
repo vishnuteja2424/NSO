@@ -1,0 +1,1880 @@
+//*************************************************************************************************
+//  Standalone NSO (Non-LSA) Jenkins build file
+//  MODIFIED: 2021-09-03
+//*************************************************************************************************
+Date startExecTime = new Date() // Get starting time
+
+credentialsId = "345c79bc-9def-4981-94b5-d8190fdd2304"
+githubURL = "https://wwwin-github.cisco.com/AS-BAC/AS-BAC-NSO.git"
+artifactURL = "https://engci-maven-master.cisco.com/artifactory/"
+tailfNedURL = 'https://earth.tail-f.com:8443/ncs-pkgs'
+sonarHostURL = "https://engci-sonar-sjc.cisco.com/sonar/"
+artifactUser = "as-deployer"
+artifactPasswd = "yp41v2t9wiuanhfr"
+artifactFolder = "AS-release/Customer/AS-BAC/AS-BAC-NSO/"
+sonarDashbd = "dashboard?id=cx-spade-sjc-41"
+signingDocker = "dockerhub.cisco.com/cx-bac-bpa-internal-docker/rpmsign:1.0.5"
+
+// The following values are set in the variables file and/or the Build Parameter Form
+def nsoBranch
+def testcaseBranch
+def packageName
+def EMAIL
+def artifactLeafFolder
+def uploadTestsToCXTM
+def signRPMs
+def createRPMs
+def createDebugLogs
+def nsoImageVersion
+def cxtaImageVersion
+def CXTATimeLimit
+def executeSonarQube
+def executeCXTAtests
+def worker_node = ""   // or "apjc-bac-slv01" or "apjc-sio-slv01" -slv02 -slv03, etc.
+
+// The following constants are used as default values for the Build Parameter Form
+defCXTATimeLimit = 2
+defEMAILlist = ['bac-nso-functest@cisco.com','bac-eps-nso-release@cisco.com','']
+defNodeList = ['apjc-bac-slv01','apjc-sio-slv01','apjc-sio-slv02','apjc-sio-slv03','amer-sio-slv01','amer-sio-slv02','amer-sio-slv03','amer-sio-slv04','amer-sio-slv05','amer-sio-slv06','amer-sio-slv07','amer-sio-slv08','amer-sio-slv09','amer-sio-slv10','amer-sio-slv11']
+
+// The following are variables used within the build process
+def buildIDstr = "${env.JOB_NAME}_${env.BUILD_NUMBER}".replaceAll('-', '_').replaceAll('/', '_').replaceAll(' ', '_')
+def pipelineNum = "${env.BUILD_NUMBER}"
+def releaseNum
+def dockersCreated = false
+def cxta_network = "cxta_network_${buildIDstr}"
+def networkId
+def uploadRPMsToArtifactory
+def cxtaContainer
+def cxtaImage
+def nedList = []
+def nedVerList = []
+def NSO_packageList
+def nsoPlatformVersionNSO
+def totalTestTime
+def packageVersion = "000"
+def branchName
+def TEST_SUITES_ARR
+def artifactDir
+bldCause = ""
+RequesterID = ""
+BuildStage = ""
+nsoVersNum = 0
+
+// The following constants give pre-defined values used in the code
+NSOcontentFName = "nso_contents.yml"
+NSOsettingsFName = "nso_settings.xml"
+variablesFN = "variables.yml"
+devVariablesFN = "dev_variables.yml"
+WildcardDevXml = "*device.xml"
+WildcardDevYml = "*devices.yml"
+WildcardLoadXml = "*load.xml"
+
+changesFN = "CHANGES"
+NSO_hostIP = "3"
+CXTA_hostIP = "4"
+nsoPostDeployFolder = "nso-postdeployment-config" // name of the post-deploy file folder in the git
+nsoMockDevFolder = "mockdevice-config"
+//requestDispatcherURL = "/api/running/casb/reference-data/request-dispatcher -H Content-Type:application/vnd.yang.data+json"	// For REST curl (remove after migrtn to NSO5.4+)
+requestDispatcherURL = "/restconf/data/casb:casb/casb:reference-data/request-dispatcher:request-dispatcher -H Content-Type:application/yang-data+json"		// For RESTCONF curl
+cxtaRootFolder = "/home/cisco/project"
+testFileSubfolder = "tests"					// Matches FT subfolder name in git
+robotFileSubfolder = "robot_files"			// Matches FT subfolder name in git
+payloadFileSubfolder = "json_files"			// Matches FT subfolder name in git
+testFolder = "${cxtaRootFolder}/${testFileSubfolder}"
+robotFileFolder = "${testFileSubfolder}/${robotFileSubfolder}"
+payloadFileFolder = "${testFileSubfolder}/${payloadFileSubfolder}"
+netsimDevFNmatch = "*Dispatcher.json"
+CXTApassThreshold = 100
+CXTAunstableThreshold = 66
+
+// The following are used for tuning depending on if we are using the CXTA-built NSO Docker image or the new BU-built image
+newDkrImageVer = false 						// Set false if using CXTA-built NSO image, true if using new BU-built image
+pyImageSubStr = ""							// If using CXTA-built NSO image: null for pre-5.4 NSO, "-ph3" for post-5.4 NSO
+relRunRootDir = "/var/opt"					// Root directory where the NSO 'run' directory resides for the actual RPM release.
+relRunDir = "${relRunRootDir}/ncs"			// NSO 'run' directory for the actual RPM release
+runDir = ""									// NSO 'run' directory for the pipeline build.  (=/nso/run for new BU-built image.)
+
+//------------------------------------------------------------
+// NOTE: Two docker containers will be created below. These 
+//       are named as follows (forced by external functions):
+//         nso_container_1_${buildIDstr} - for NSO
+//         cxta_container_${buildIDstr} - for CXTA testing
+//------------------------------------------------------------
+
+
+//=================================================================================================
+//=================================================================================================
+//              Internal Function Block
+//=================================================================================================
+//=================================================================================================
+
+//-------------------------------------------------------------------------------------------------
+//      Function to check the code out of a git repo
+//-------------------------------------------------------------------------------------------------
+
+def gitCheckout(gitBranch) {
+    checkout([
+        $class                           : 'GitSCM',
+        branches                         : [[name: "${gitBranch}"]],
+        doGenerateSubmoduleConfigurations: false,
+        extensions                       : [],
+        submoduleCfg                     : [],
+        userRemoteConfigs                : [[credentialsId: "${credentialsId}",
+        url                              : "${githubURL}"]]])
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to execute a shell command string then print & return the result
+//-------------------------------------------------------------------------------------------------
+
+def exec_cmd(command, echoText="") {
+    def output = sh(script: command, returnStdout: true).trim()
+    echo "$echoText$output"
+    return output
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to execute a debug command & output the result (IF the Debug flag is set)
+//-------------------------------------------------------------------------------------------------
+
+def debug_cmd(command, echoText="") {
+    if ( showDebugInfo ) {
+        def output = sh(script: command, returnStdout: true).trim()
+        echo "$echoText\n$output"
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to parse an NSO contents YAML file and extract the values
+//-------------------------------------------------------------------------------------------------
+
+def get_contents_yaml_data(Role, contentFN) {
+
+    // Preset the yaml filename to be the cleaned contents.yml file
+    def yamlFN = "${Role}-contents-clean.yml"
+
+    // If the Role is passed, this is the first time through, so clean the contents file first
+    if ( Role != "" ) {
+        // Copy and clean the packages YAML file - removing any comments and replacing all tabs with spaces (just in case)
+        exec_cmd("sed '/^[[:blank:]]*#/d;s/#.*//' ./${contentFN} > tmp_content.yml && sed 's/\t/    /g' tmp_content.yml > ${Role}-contents-clean.yml")
+
+    } else {
+        // Set the yaml filename to be the passed contents.yml file
+        yamlFN = contentFN
+    }
+
+    // get "nso <vers>:" key from the contents YAML file (has to be done manually with awk, as the NSO version# is a variable)
+    def nsoKey = exec_cmd("awk '{ if (\$1==\"nso\") {print} }' ${yamlFN} | sed 's/://g'","${Role} NSO Key = ")
+
+    // Read in the contents YAML file, ready for processing
+    def yaml_content = readYaml file: "${yamlFN}"
+
+    // Get the list of package names from the contents YAML file.
+    yaml_content.each {
+        def key = it.key
+        packageList = yaml_content[key].get(nsoKey) //get nested key "nso"
+    }
+    echo "List of Packages for ${Role}:\n${packageList}"
+
+    // Get the NED definition lines from contents YAML file.
+    yaml_content.each {
+        def key = it.key
+        nedVerList = yaml_content[key].get('ned-versions')
+    }
+    echo "List of NED definitions for ${Role}:\n${nedVerList}"
+
+    // For each NED line, extract the NED name
+    List nedList = []
+    nedVerList.each {
+        nedList.add(it.split()[0].split()[0])
+    }
+    echo "List of NED folder names for ${Role}:\n${nedList}"
+
+    // get NSO version from the contents YAML file 'nso' key
+    def nsoPlatformVersion = nsoKey.split()[1]
+    echo "${Role} NSO Platform Version = ${nsoPlatformVersion}"
+
+    // Determine if NSO image version is 5.4 or greater (or not)
+    // [THIS BLOCK MAY BE REMOVED AFTER WE'VE COMPLETELY MIGRATED PAST NSO 5.4]
+    def tmpNSOVers = nsoPlatformVersion.split(/\./)
+    pyImageSubStr = ""
+    nsoVersNum = "${tmpNSOVers[0]}${tmpNSOVers[1]}" as int
+    echo "Major NSO version as a number = ${nsoVersNum}"
+    if ( nsoVersNum < 54 ) {
+        echo "NSO version is LESS than 5.4"
+    } else {
+        echo "NSO version is greater than 5.4"
+
+        // Must add the Py3 subscript if using the CXTA image for post 5.4 versions
+        if ( !newDkrImageVer ) { pyImageSubStr = "-ph3" }
+    }
+
+    // Use sed to get the contents YAML file lines up to "nso", then pipe that to awk to assign
+    // the lines to an array. Then grab the first element as the build package version.
+    def VerLines = exec_cmd("sed '/nso/q' ${yamlFN} | awk '/:/ {print \$2}'").split("\n")
+    nsoPkgRelVersion = VerLines[0].minus(":")
+    echo "Package Version = " + nsoPkgRelVersion
+
+    return [packageList, nedList, nedVerList, nsoPlatformVersion, nsoPkgRelVersion]
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to checkout package code and retrieve the package & NED lists and NSO version
+//-------------------------------------------------------------------------------------------------
+
+def checkout_pkg_code(BranchName, Role) {
+    echo "Start of git checkout for ${Role}"
+
+    // Check out code from the git branch
+    gitCheckout(BranchName)
+
+    // Create a folder for this 'role' (NSO/CFS/RFS etc) and move the 'packages' folder under it
+    exec_cmd("rm -rf ${Role} && mkdir -p ${Role} && mv Configuration-and-Provisioning/packages ${Role}/")
+
+    // See if the post-deploy config folder exists in the git)
+    if ( fileExists("${nsoPostDeployFolder}") ) {
+        echo "Post-deploy config folder exists in the git"
+
+        // Now check that files actually exist in that folder
+        def filecheck = exec_cmd("find ${nsoPostDeployFolder} -name '*.*'")
+        if ( filecheck != "" ) {
+            echo "Files exist in the Post-deploy config folder"
+
+            // Move all the files from the post-deploy config folder into the 'role' folder  */
+            exec_cmd("mv ${nsoPostDeployFolder} ${Role}/")
+
+            // Create a folder for the mock device XMLs and copy all of the Post Deploy files into it
+            exec_cmd("mkdir -p ${Role}/${nsoMockDevFolder}")
+            exec_cmd("cp -f ${Role}/${nsoPostDeployFolder}/*.* ${Role}/${nsoMockDevFolder}/")  // */
+
+            // Now delete any NSO settings files from the Mock Device folder
+            exec_cmd("rm -rf ${Role}/${nsoMockDevFolder}/${NSOsettingsFName}")
+
+            // And delete any Mock Device files from the post-deploy folder
+            exec_cmd("rm -rf ${Role}/${nsoPostDeployFolder}/${WildcardDevXml} ${Role}/${nsoPostDeployFolder}/${WildcardDevYml} ${Role}/${nsoPostDeployFolder}/${WildcardLoadXml}")
+
+            exec_cmd("ls -l ${Role}/${nsoPostDeployFolder}/","Remaining Post Deploy files:")
+            exec_cmd("ls -l ${Role}/${nsoMockDevFolder}/","Remaining Mock Device files:")
+
+        } else {
+            echo "Files DO NOT exist in the Post-deploy config folder"
+
+            // Create an empty post-deploy folder for the contents file later
+            exec_cmd("mkdir -p ${Role}/${nsoPostDeployFolder}")
+        }
+     } else {
+        echo "No post-deploy config folder found in the git"
+
+        // Create an empty post-deploy folder for the contents file later
+        exec_cmd("mkdir -p ${Role}/${nsoPostDeployFolder}")
+    }
+
+    // List the contents of the new 'role' folder
+    debug_cmd("pwd && ls -l ${Role}/")
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to create an NSO Docker Container
+//-------------------------------------------------------------------------------------------------
+
+def create_container(containerId, network, ipAddress, containerImage) {
+
+    timeout(time: 2, unit: 'HOURS') {
+        // Pull the NSO Docker image
+        nso = docker.image(containerImage)
+        echo "Pulling NSO Docker Image from: ${containerImage}"
+        nso.pull()
+
+        // Execute the Docker Command to create the NSO container 
+        def dockerCmd = "docker run -dit --name ${containerId} --network ${network} --ip ${ipAddress} -v /var/run/docker.sock:/var/run/docker.sock ${containerImage} tail -f /dev/null"
+        def nsoContainer = exec_cmd("${dockerCmd}")
+        echo "NSO Container created with id: ${nsoContainer}"
+    }
+
+    // Make sure the defaults in the docker image are correct
+    tailor_dkr_image(containerId)
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to fix any reqd defaults in the NSO docker image
+//-------------------------------------------------------------------------------------------------
+def tailor_dkr_image(containerId) {
+
+    // If using the new BU NSO Docker image, perform various tasks to 'fix' the NSO/image config
+    if ( !newDkrImageVer ) {
+        echo "Using the CXTA NSO Docker image.  No config tuning reqd."
+        runDir = relRunDir        // Old CXTA-built NSO Docker image: running directory is standard
+    } else {
+        echo "Using the NSO BU NSO Docker image.  Performing config tuning steps..."
+        runDir = "/nso/run"       // New BU-built NSO Docker image: running directory is non-standard
+
+        echo "Create a symlink to point /var/opt/ncs to ${runDir}"
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'mkdir -p ${relRunRootDir}'")
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'ln -s ${runDir}/ ${relRunDir} && ls -l ${relRunDir}/'")
+
+/*      // Make sure the default run folder is set to /var/opt/ncs, create it and move the files from the image location to it
+        // *NOT REQUIRED* (using the symlink method above)
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed -i 's#rundir=/nso/run#rundir=${runDir}#' /etc/init.d/ncs\"")
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"mkdir -p /${runDir}\"")
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"mv -f /nso/run/* ${runDir} && chmod -R 755 ${runDir}\"")
+*/
+
+        // Make sure the log folder is created */
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"mkdir -p /log && chmod 755 /log\"", "Create the /log folder")
+
+        // Create the shell admin user & group
+        echo "Add usergroup ncsadmin and add user admin to it"
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'getent group ncsadmin'")
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'useradd admin && usermod -a -G ncsadmin admin'")
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'echo -e \"admin\nadmin\" | passwd admin'")
+        if ( containerId.contains("_1_") ) {debug_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'cat /etc/passwd'")}  // DEBUG:
+
+        // Add admin user to nacm/ncsadmin group in aaa_init.xml
+        if ( containerId.contains("_1_") ) {debug_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed 's/ /^/g' ${runDir}/cdb/aaa_init.xml\"","*** Content of the original aaa_init.xml file: ")}
+        def aaaContents = exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"grep '<user-name>' ${runDir}/cdb/aaa_init.xml\"")
+        if ( aaaContents.contains("admin") ) {
+            echo "User admin already exists in aaa_init.xml"
+        } else {
+            echo "Adding user admin to aaa_init.xml"
+            exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed -i -z 's#ncsadmin</name>\\n        <user-name>private</user-name>#ncsadmin</name>\\n        <user-name>private</user-name>\\n        <user-name>admin</user-name>#' ${runDir}/cdb/aaa_init.xml\"")
+        }
+
+        // DEBUG: Display users converting all spaces to "^"
+        if ( containerId.contains("_1_") ) {debug_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed 's/ /^/g' ${runDir}/cdb/aaa_init.xml\"","*** Content of the updated aaa_init.xml file: ")}
+        if ( containerId.contains("_1_") ) {debug_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'id admin'")}
+
+        // Make the ssh key file writeable
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"chmod 644 /opt/ncs/current/netsim/confd/etc/confd/ssh/ssh_host_rsa_key\"","Make the ssh key file writeable")
+    }
+
+    // Create the ncs.conf file from ncs.conf.in, if reqd
+    def ncsConfExists = exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"ls /etc/ncs/ncs.conf*\"")
+    if ( ncsConfExists.contains("ncs.conf.in") ) {
+        exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c 'mv -f /etc/ncs/ncs.conf.in /etc/ncs/ncs.conf'")
+    }
+
+    // DEBUG: Convert all spaces in the ncs.conf file to "^" and display the contents (Pre-update)
+    if ( containerId.contains("_1_") ) {debug_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed 's/ /^/g' /etc/ncs/ncs.conf\"","*** Content of the orig ncs.conf file: ")}
+
+    // Modify the 'ncs.conf' file to enable various features (ssh and tcp enable etc.)
+    echo "Modify the 'ncs.conf' file to enable ssh and tcp etc."
+    exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed -i -z 's#<ssh>\\n      <enabled>false<#<ssh>\\n      <enabled>true<#g' /etc/ncs/ncs.conf\"")
+    exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed -i -z 's#<ssh>\\n        <enabled>false<#<ssh>\\n        <enabled>true<#g' /etc/ncs/ncs.conf\"")
+    exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed -i -z 's#<tcp>\\n        <enabled>false<#<tcp>\\n        <enabled>true<#g' /etc/ncs/ncs.conf\"")
+    exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed -i -z 's#<enabled>false</enabled>\\n    </lsa>#<enabled>true</enabled>\\n    </lsa>#g' /etc/ncs/ncs.conf\"")
+
+    // DEBUG: Convert all spaces in the ncs.conf file to "^" and display the contents (Post-update)
+    if ( containerId.contains("_1_") ) {debug_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"sed 's/ /^/g' /etc/ncs/ncs.conf\"","*** Content of the updated ncs.conf file: ")}
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to parse a contents.yml file and extract & install the list of NEDs from it
+//-------------------------------------------------------------------------------------------------
+
+def install_neds_from_yaml(yamlFile, containerList, credentialsId) {
+
+    // Get the data from the contents YAML file
+    (packageList, nedList, nedVerList, nsoPlatformVersion, nsoPkgReleaseVersion) = get_contents_yaml_data("", yamlFile) 
+
+    // Start each container in the passed list & install the list of NEDs onto it
+    containerList.each{
+        def containerId = it
+
+        // Set credentials, ready to pull NEDs
+        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${credentialsId}", 
+                          usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+
+            // Start up the NSO
+            exec_cmd("docker exec -u root -i ${containerId} /bin/bash -c \"source /opt/ncs/current/ncsrc && /etc/init.d/ncs start && /etc/init.d/ncs status\"")
+
+            // Make sure that at least one NED is defined
+            if ( nedVerList ) {
+                echo "NEDs to Install on NSO: ${nedVerList}"
+
+                // Process all the NEDs passed in the list
+                for (def entry in nedVerList) {
+
+                    // Get the information for *this* NED
+                    def nedName = entry.split("-cli-")[0]  //getting only ned name without cli
+                    def nedVersion = entry.split()[1]
+                    def nsoVersion = entry.split()[2]
+
+                    // Install this NED on this NSO container
+                    install_single_ned("${nedName}", "${nedVersion}", "${nsoVersion}", "${containerId}")
+                }
+            } else {
+                echo "ERROR: no NEDs specified"
+            }
+        }
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to install a single NED on an NSO Container
+//-------------------------------------------------------------------------------------------------
+
+def install_single_ned(nedName, nedVersion, nsoVersion, containerId) {
+
+    def tmpNedDir = "/tmp/nso/neds"
+    def getCmd = "curl -k -u $USERNAME:$PASSWORD"
+    def binNedFname = "ncs-${nsoVersion}-${nedName}-${nedVersion}.signed.bin"
+    def tarNedFname = "ncs-${nsoVersion}-${nedName}-${nedVersion}.tar.gz"
+
+    echo "Installing NED ${binNedFname}"
+
+    // Create the directory both on the Host and on the Target container to place the NED
+    exec_cmd("mkdir -p ${tmpNedDir} || true")
+    exec_cmd("docker exec -i -u root ${containerId} /bin/bash -c \"mkdir -p ${tmpNedDir} && chown admin:ncsadmin ${tmpNedDir}\"")
+
+    // Pull the NED from its repository using curl and copy it into the Container
+    exec_cmd("${getCmd} --output ${tmpNedDir}/${binNedFname} ${tailfNedURL}/${nedName}/${nsoVersion}/${binNedFname}")
+    exec_cmd("docker cp ${tmpNedDir}/${binNedFname} ${containerId}:${tmpNedDir}/${binNedFname}")
+
+    // Set it to be executable and set ownership
+    exec_cmd("docker exec -u root -i  ${containerId} /bin/bash -c \"chmod 755 ${tmpNedDir}/${binNedFname} && chown admin:ncsadmin ${tmpNedDir}/${binNedFname}\"")
+
+    // Run the binary & then tar to extract it
+    exec_cmd("docker exec -u root -i ${containerId} ${tmpNedDir}/${binNedFname}")
+    exec_cmd("docker exec -u root -i ${containerId} tar zxvf ${tarNedFname} -C ${runDir}/packages")
+
+    // Cleanup: Remove the downloaded .bin installer
+    exec_cmd("rm -f ${tmpNedDir}/${binNedFname}")
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to load an XML file or XML data onto a running NSO
+//-------------------------------------------------------------------------------------------------
+
+def nso_load_xml(containerId, sourceType, xmlFileName="", xmlData="") {
+// Valid options for sourceType are File or Data
+
+    if ( sourceType.equals("Data") ) {
+
+        // We are loading XML from passed data... write it out to a file first
+        if ( xmlData ) {
+            // Passed data does exist
+            xmlFileName = "ncsLoadFile_${containerId}.xml"
+            echo "Storing passed XML data in a temporary file: '${xmlFileName}'"
+
+            // Create a temporary file and write the data to it
+            writeFile file:"${xmlFileName}", text:"${xmlData}"
+        }
+    } else if ( !sourceType.equals("File") ) {
+        echo "Unknown sourceType specified"
+    }
+
+    // We are loading XML from a file... either one that was passed directly, or one that was created from passed data
+    if ( xmlFileName ) {
+        // Passed filename does exist
+        echo "Loading XML file '${xmlFileName}' onto NSO: ${containerId}"
+
+        // First we need to copy the file from the host to the Container
+        exec_cmd("docker cp ${xmlFileName} ${containerId}:/tmp/")
+
+        // Now we can load the file, and then delete it afterward
+        exec_cmd("docker exec -i -u root ${containerId} /bin/bash -c \"source /opt/ncs/current/ncsrc && ncs_load -l -m -u admin /tmp/${xmlFileName} && rm -f /tmp/${xmlFileName}\"")
+    } else {
+        echo "Error no data was specified to load onto the NSO"
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to copy/compile/reload packages to an NSO
+//-------------------------------------------------------------------------------------------------
+
+def install_packages(list, Role, containerId, buildIDstr) {
+    echo "Start copy/compile/reload of packages to the ${Role} on container ${containerId}"
+
+    // Copy the packages to the relevant container
+    for (int i = 0; i < list.size(); i++) {
+        // First check that the folder exists (NED folders will not - they were already moved)
+        if ( fileExists("${Role}/packages/${list[i]}") ) {
+            echo "Copying package ${list[i]} to ${Role}:${containerId}"
+            exec_cmd("docker cp \"${Role}/packages/${list[i]}\" ${containerId}${buildIDstr}:${runDir}/packages/ ;echo \$?")
+        }
+    }
+
+    // Set ownership of everything that's now in the ${runDir}/ folder
+    sh(script: "docker exec -u root -i ${containerId}${buildIDstr} /bin/bash -c 'chown -R admin:ncsadmin ${runDir}/'")
+
+    // Compile each package in the passed list
+    for (int i = 0; i < list.size(); i++) {
+        echo "Compiling Package ${list[i]}"
+        exec_cmd("docker exec -u admin -i ${containerId}${buildIDstr} /bin/bash -c 'source /opt/ncs/current/ncsrc && cd ${runDir}/packages/${list[i]}/src && make clean all'")
+    }
+
+    // Reload the packages and show the list from cli
+    exec_cmd("docker exec -i ${containerId}${buildIDstr} /bin/bash -c \"source /opt/ncs/current/ncsrc && echo '\''packages reload'\'' | ncs_cli -u admin -C\"")
+    exec_cmd("docker exec -i ${containerId}${buildIDstr} /bin/bash -c \"source /opt/ncs/current/ncsrc && echo '\''show packages package package-version'\'' | ncs_cli -u admin -C\"")
+
+/*
+    // DEBUG: Finally, list the contents of the /packages and post-deploy folders on the container
+    debug_cmd("docker exec -i ${containerId}${buildIDstr}  /bin/bash -c \"ls -l ${runDir}/packages\" ", "PACKAGES FOLDER CONTENTS:\n")
+    if ( fileExists("${Role}/${nsoPostDeployFolder}") ) {
+        debug_cmd("docker exec -i ${containerId}${buildIDstr}  /bin/bash -c \"ls -l ${runDir}/${nsoPostDeployFolder}\" ", "\nPOST DEPLOY FOLDER CONTENTS:\n")
+    }
+*/
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to create all the netsim devices from the Dispatcher json files
+//-------------------------------------------------------------------------------------------------
+
+def create_netsim_devices(buildIDstr, nedList) {
+
+    def netsimDir = "/tmp/nso/netsim"
+    def nedDir = "${runDir}/packages"
+    def nodeMap = [:]
+
+    // Collect the list of all device/dispatcher Json files 
+    def devJsonList = exec_cmd("ls ${payloadFileFolder}/${netsimDevFNmatch}").split()  // List all the device/dispatcher payloads
+    echo "List of JSONs: ${devJsonList}"
+
+    // Go through each device/dispatcher Json file in the list and create a superset node-device map
+    for (jsonFile in devJsonList) {
+        echo "Scanning Json file : " + jsonFile
+        def jsonObject = readJSON file: jsonFile // reading JSON file
+        def deviceList = jsonObject."request-dispatcher:request-dispatcher" //getting list of devices
+        for (device in deviceList) {
+             nodeMap[device["rfs-node"]] = nodeMap.get(device["rfs-node"], []) + device  // Separating device based on rfs-node {'node1': [], 'node2': []}
+        }
+    }
+
+    // Loop over each NSO node in the mapping and create the netsim devices on that node
+    nodeMap.each { entry ->
+        // Get this node and its list of devices
+        def node = "$entry.key"
+        def node_device_list = "$entry.value"
+
+        // Get the container number corresponding to this node
+        def container_number = node.find(/\d+/) // Get the container number, e.g. if node="RFS1" -> container_number=1
+        if ( !container_number ){ container_number = 1 }  // If this is a single non-LSA node (="NSO"), force the number to be 1
+        def dockerContainerId = "nso_container_${container_number}_${buildIDstr}"
+        echo "This container number = "+ dockerContainerId
+
+        // Remove any duplicate device names from the generated list
+        echo "Superset device list = " + nodeMap[node]
+        List filteredList = [];
+        Set ListOfDevices = [];
+        for(item in nodeMap[node]){
+            if ( !ListOfDevices.contains(item['device']) ){
+                filteredList.add(item);
+                ListOfDevices.add(item['device'])
+            }
+        }
+        echo "Device list w/no duplicates and basic device types = " + filteredList
+
+        // Now update the device NED types with the full NED name (incl version)
+        for ( i = 0; i < filteredList.size(); i++ ) {
+            nedName = filteredList[i].get('device-type')
+            for ( thisNed in nedList ) {
+                if ( nedName == thisNed.split("-cli-")[0] ) {
+                    filteredList[i].put('device-type', thisNed)
+                    echo "Found match: ${nedName} ==> ${thisNed}, for device: " + filteredList[i].get('device')
+                    break
+                }
+            }
+        }
+        echo "Device list w/full NED names  = " + filteredList
+
+        // Create and set up the netsim folder on the container
+        exec_cmd("docker exec -u root -i ${dockerContainerId} /bin/bash -c \"mkdir -p ${netsimDir} || true && chown -R admin:ncsadmin ${netsimDir}\"")
+
+        // Create the netsim network for this node, using the first device in the list
+        def nedName = filteredList[0].get('device-type')
+        def deviceName = filteredList[0].get('device')
+        echo "Creating Netsim Network on ${node} - with netsim device ${deviceName}, of type ${nedName}, in netsim folder ${netsimDir}"
+        exec_cmd("docker exec -u admin -i ${dockerContainerId} /bin/bash -c \"source /opt/ncs/current/ncsrc && ncs-netsim create-device ${nedDir}/${nedName} ${deviceName} --dir ${netsimDir}\"")
+
+        // Now add all the remaining netsim devices in the list
+        for ( i = 1; i < filteredList.size(); i++ ) {
+            nedName = filteredList[i].get('device-type')
+            deviceName = filteredList[i].get('device')
+            echo "Adding netsim device ${deviceName}, of type ${nedName}, to ${node}"
+            exec_cmd("docker exec -u admin -i ${dockerContainerId} /bin/bash -c \"source /opt/ncs/current/ncsrc && ncs-netsim add-device  ${nedDir}/${nedName} ${deviceName} --dir ${netsimDir}\"")
+        }
+
+        // Finally for this node, start netsim and create/load the devices.xml
+        echo "Starting netsim on ${node} and loading devices.xml"
+        exec_cmd("docker exec -u admin -i ${dockerContainerId} /bin/bash -c \"source /opt/ncs/current/ncsrc && cd ${netsimDir} && ncs-netsim start --dir ${netsimDir} && ncs-netsim ncs-xml-init > devices.xml && ncs_load -l -m devices.xml\"")
+    }
+
+    // List the devices and perform a sync-from for the NetSim Devices created on the NSO
+    exec_cmd("docker exec -i nso_container_1_${buildIDstr} /bin/bash -c \"source /opt/ncs/current/ncsrc && echo '\''show devices list'\'' | ncs_cli -u admin -C\"")
+    def syncResults = exec_cmd("docker exec -i nso_container_1_${buildIDstr} /bin/bash -c \"source /opt/ncs/current/ncsrc && echo '\''devices sync-from'\'' | ncs_cli -u admin -C\"")
+
+    // Abort the build if one or more devices fails to sync.
+    if ( syncResults.contains("result false") ) {
+        currentBuild.result = 'ABORTED'
+        error("*** ABORTED: One or more netsim devices failed to sync to NSO ***")
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to execute any pre-config scripts on created NetSim devices
+//-------------------------------------------------------------------------------------------------
+
+def device_preconfigs(buildIDstr) {
+
+    // Set the default folder to the tests folder to find/copy any netsim device pre-config scripts to the NSO containers
+    dir("${WORKSPACE}/${testFileSubfolder}") {
+
+        // Find any/all pre-config Netsim device response cli files
+        def copyfiles = exec_cmd("find -name '*.cli'", "List of .cli files:\n").split()
+        if ( copyfiles ) { 
+            // CLI files DO exist, copy them to NSO container
+            echo "Copying device response cli files to NSO containers."
+            for (i = 0; i < copyfiles.size(); i++) {
+                exec_cmd("docker cp \"${copyfiles[i]}\" nso_container_1_${buildIDstr}:${runDir}/")
+            }
+        }
+
+        // Find any/all pre-config Netsim device response script files
+        copyfiles = exec_cmd("find -name '*.cmdsh'", "List of .cmdsh files:\n").split()
+        if ( copyfiles ) { 
+            // cmdsh files DO exist, copy them to NSO container
+            echo "Copying device response script files to NSO containers."
+            for (i = 0; i < copyfiles.size(); i++) {
+                exec_cmd("docker cp \"${copyfiles[i]}\" nso_container_1_${buildIDstr}:${runDir}/")
+            }
+        }
+
+        // Find any/all pre-config script files
+        copyfiles = exec_cmd("find -name '*.sh'", "List of script files:\n").split()
+        if ( copyfiles ) { 
+            // Scripts DO exist, copy them to NSO containers & execute
+            echo "Copying script files to NSO containers and executing them."
+            for (i = 0; i < copyfiles.size(); i++) {
+
+                // Strip the folder to get just the file name and lower-case it
+                scriptName = copyfiles[i].substring(copyfiles[i].lastIndexOf("/") + 1).toLowerCase()
+
+                // Copy it to the NSO container, execute it and delete it afterward (to avoid non-unique fname conflicts)
+                exec_cmd("docker cp \"${copyfiles[i]}\" nso_container_1_${buildIDstr}:${runDir}/${scriptName}")
+                exec_cmd("docker exec -u admin -i nso_container_1_${buildIDstr} /bin/bash -c \"source /opt/ncs/current/ncsrc && bash ${runDir}/${scriptName}\"")
+                exec_cmd("docker exec -u admin -i nso_container_1_${buildIDstr} /bin/bash -c \"rm -f ${runDir}/${scriptName}\"")
+            }
+
+        } else {
+            echo "***************** No pre-configuration files were found, so no pre-configs applied *****************"
+        }
+
+        // Finally, remove any leftover pre-config files
+        exec_cmd("docker exec -u root -i nso_container_1_${buildIDstr} /bin/bash -c \"rm -f ${runDir}/*.cli ${runDir}/*.cmdsh\"")  /* */
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to copy complied packages from NSO onto Jenkins for Sonarqube scan
+//-------------------------------------------------------------------------------------------------
+
+def sonar_copy_packages(list, containerId, buildIDstr) {
+    echo "Start package copying for SonarQube"
+
+    for (int i = 0; i < list.size(); i++) {
+        echo "Copying Package ${list[i]}"
+        exec_cmd("docker cp ${containerId}${buildIDstr}:${runDir}/packages/${list[i]} ${WORKSPACE}/sonarscan")
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to copy and run the Functional tests
+//-------------------------------------------------------------------------------------------------
+
+def run_cxta_tests(containerId, CXTATimeLimit) {
+
+    // Define the name of the Test Suite/Case/Directory to run with Robot
+    String testName = "${robotFileSubfolder}"
+    //              = "-L TRACE ${robotFileSubfolder}"   // Add extra trace lines for debug if reqd.
+
+    // The location where the test reports outputs are stored
+    String outputsDir = "${cxtaRootFolder}/outputs"
+
+    // Copy the tests to the container
+    dir("tests") {
+        echo "Copying Functional tests to the test container"
+        exec_cmd("docker exec -i ${containerId} /bin/bash -c \"mkdir -p ${testFolder} || true\"")
+        exec_cmd("docker cp . ${containerId}:${testFolder}")
+        exec_cmd("docker exec -i ${containerId} /bin/bash -c 'cd ${testFolder} && ls -lR'")
+    }
+
+    // Execute the tests
+    def debugTests = "-b debug.txt"  // Set to "" if no debug info reqd.
+    echo "The timeout value for CXTA test execution is ${CXTATimeLimit} hour(s)"
+    timeout(time: CXTATimeLimit, unit: 'HOURS') {
+        echo "CXTA - Running the Robot tests with DEBUG"
+        exec_cmd("docker exec -i ${containerId} /bin/bash -c \"cd ${testFolder} && robot ${debugTests} ${testName} || true \"")
+    }
+
+    // Publish the test results
+    timeout(time: 2, unit: 'HOURS') {
+        echo "CXTA - Publish test results"
+        exec_cmd("docker exec -i ${containerId} /bin/bash -c \"mkdir -p ${outputsDir} && cd ${testFolder} && cp *.xml *.html ${outputsDir}/ && cd ${outputsDir} && tar cvzf ${outputsDir}/output.tar.gz report.html log.html output.xml\"")
+        exec_cmd("docker cp ${containerId}:${outputsDir}/output.tar.gz ./ || true")
+        exec_cmd("tar -xvf output.tar.gz || true")
+
+        step([$class : 'RobotPublisher', outputPath : "${WORKSPACE}", disableArchiveOutput : false, onlyCritical : false, passThreshold : CXTApassThreshold, unstableThreshold: CXTAunstableThreshold, otherFiles: ""])
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to create the package versions file from the packages YAML file 
+//-------------------------------------------------------------------------------------------------
+
+def version_file_gen(Role, releaseNum, pkgsFolder) {
+    echo "Start generating the package/version file to go in the RPM"
+
+    // Set the output filename
+     def pkgVerFN = "packageVersions${Role}.yml"
+
+    // Get the data from the contents YAML file, then sort the list of packages
+    (packageList, nedList, nedVerList, nsoPlatformVersion, nsoPkgReleaseVersion) = get_contents_yaml_data("", "${Role}-contents-clean.yml") 
+    packageList = packageList.sort()
+    //echo "List of Packages for ${Role}:\n${packageList}"
+
+    // For each of the above packages, extract the pkg version num from the associated pkg metadata XML file
+    // (Use sed to replace "<>" with spaces, then pipe that to awk to get the version line)
+    def versionList = []
+    for (int i = 0; i < packageList.size(); i++) {
+        versionList[i] = exec_cmd("sed 's/</ /g; s/>/ /g; /package-version/q' ${pkgsFolder}/${packageList[i]}/package-meta-data.xml | awk '/package-version/ {print \$2}'")
+        if ( versionList[i].isEmpty() ) { versionList[i] = "1.0" }  // If no version entry (or file) is found, default to v1.0
+    }
+
+    // Create the empty package versions file
+    exec_cmd("rm -rf ${pkgVerFN} && touch ${pkgVerFN}")
+
+    // Write out the list of package name/version lines
+    def lcRole = Role.toLowerCase()
+    exec_cmd("echo '${lcRole}-microservices ${nsoPkgReleaseVersion}-${releaseNum}:' >> '${pkgVerFN}'")
+    exec_cmd("echo '    nso ${nsoPlatformVersion}:' >> '${pkgVerFN}'")
+    for (int i = 0; i < packageList.size(); i++) {
+        exec_cmd("echo '        - ${packageList[i]}  ${versionList[i]}' >> '${pkgVerFN}'")
+    }
+
+    // If there are NED entries, construct the list of NED name/versions and write them out too
+    if ( nedVerList != "N/A" ) {
+        exec_cmd("echo '    ned-versions:' >> '${pkgVerFN}'")
+
+        for (int i = 0; i < nedVerList.size(); i++) {
+            exec_cmd("echo '        - ${nedVerList[i-1]}' >> '${pkgVerFN}'")
+        }
+    }
+
+    // Show the content of the resulting file
+    exec_cmd("cat ${pkgVerFN}", "Package-Versions file :\n")
+
+    return nsoPkgReleaseVersion
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to create an RPM spec file
+//-------------------------------------------------------------------------------------------------
+
+def rpm_spec_gen(Role, relName, pkgVersion, releaseNum, pkgFolder, specFilename) {
+    echo "Create an RPM spec file for the ${Role} - ${specFilename}"
+
+    // Create the SPEC file header lines
+    def specContentHdr = """
+        %define _topdir     /tmp/cisco/${Role}
+        %define name        ${relName}
+        %define version     ${pkgVersion}
+        %define release     ${releaseNum} 
+        %define buildroot %{_topdir}/%{name}-%{version}-root
+        %define _binaries_in_noarch_packages_terminate_build   0 
+        BuildRoot:  %{buildroot}
+        Name:           %{name}
+        Release:        %{release}
+        Version:        %{version}
+        Source:         %{name}-%{version}.tar.gz
+        Summary:        RPM for $Role (${relName}) version ${pkgVersion}-${releaseNum}
+        Prefix:         /var
+        Group:          Development/Tools
+        License:        GPL
+        BuildArch:      noarch
+        Requires:       /bin/sh
+        %description
+        RPM for $Role (${relName}) version ${pkgVersion}-${releaseNum}
+        Package         ${relName}
+        %prep
+        %setup -q
+        rm -rf %{buildroot}${relRunDir}/packages
+        mkdir -p %{buildroot}${relRunDir}/packages
+        rsync -a %{_topdir}/BUILD/%{name}-%{version}/packages/* %{buildroot}${relRunDir}/packages
+        rm -rf %{buildroot}${relRunDir}/${nsoPostDeployFolder}
+        mkdir -p %{buildroot}${relRunDir}/${nsoPostDeployFolder}
+        rsync -a %{_topdir}/BUILD/%{name}-%{version}/${nsoPostDeployFolder}/* %{buildroot}${relRunDir}/${nsoPostDeployFolder}
+        """.replaceFirst("\n","").stripIndent()
+
+    // Get the directory listing of all the files in the packages folder into a file and add that list into the SPEC file contents
+    specContentHdr = specContentHdr + """
+        %clean
+        rm -rf %{buildroot}
+        %files
+        %defattr(-,admin,ncsadmin,-)
+        """.replaceFirst("\n","").stripIndent()
+
+    // Get the directory listing of all the files in the packages folder into a file and add that list into the SPEC file contents
+    def FNames = exec_cmd("ls ${pkgFolder}").split()
+    for(File in FNames) {
+        specContentHdr = specContentHdr + "${relRunDir}/packages/${File}\n"
+    }
+
+    // Get the directory listing of any files in the post-deploy config folder and add that list into the SPEC file
+    FNames = exec_cmd("ls ${relName}-${pkgVersion}/${nsoPostDeployFolder}").split()
+    for(File in FNames) {
+        specContentHdr = specContentHdr + "${relRunDir}/${nsoPostDeployFolder}/${File}\n"
+    }
+
+    // Output the spec file contents to the passed filename
+    exec_cmd("echo '${specContentHdr}' >> '${specFilename}'")
+
+    echo '*************** END Spec file content creation ***************\n\n'
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to process the packages' change history files
+//-------------------------------------------------------------------------------------------------
+
+def process_change_histories(BuildInfo, Project, Role, PackagesFile, WriteFile) {
+    echo "Start of processing change history files"
+
+    // Create empty file for writing out to, then add header text
+    exec_cmd("rm -rf ${WriteFile} && touch ${WriteFile}")
+    def TextStr = """
+        ****************************************************************************************************
+        Compiled list of change history files for ${Project} ${Role} packages in build : ${BuildInfo}
+        ****************************************************************************************************
+        """.replaceFirst("\n","").stripIndent()
+    exec_cmd("""echo "${TextStr}" >> ${WriteFile}""")
+
+    // Get the array of package names from packages YAML file, and then also the package versions  
+    // (Use sed to print the YAML file lines up to "ned-versions", then pipe that to awk
+    //  to print only the words starting with " - ")
+    def Pkgs = exec_cmd("sed '/ned/q' ${PackagesFile} | awk '/ - / {print \$2}'").split("\n")
+    def Vers = exec_cmd("sed '/ned/q' ${PackagesFile} | awk '/ - / {print \$3}'").split("\n")
+
+    // Loop through the list of packages, getting the change history file for each
+    for (int i = 0; i < Pkgs.size(); i++) {
+
+        echo "Processing package ${Pkgs[i]}"
+
+        // Create sub-header for this package
+        TextStr = """
+            
+            ================================================================================================
+            Change History for package : ${Pkgs[i]}, current version ${Vers[i]}
+            ================================================================================================
+            """.stripIndent()
+        exec_cmd("""echo "${TextStr}" >> ${WriteFile}""")
+
+        // Now append the change history file for this package (if it exists)
+        dir("${WORKSPACE}/${Role}/packages/${Pkgs[i]}") {
+            if ( fileExists("${changesFN}") ) {
+                exec_cmd("cat ${changesFN} >> ${WriteFile}")
+            } else {
+                exec_cmd("echo '### No change history file found for this package' >> ${WriteFile}")
+            }
+        }
+    }
+
+    // Finally, show the contents
+    exec_cmd("cat ${WriteFile}")
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to generate an NSO RPM
+//-------------------------------------------------------------------------------------------------
+
+def generate_rpm(releaseNum, packageName, Role, containerId, buildIDstr){
+    echo "Start of generation of RPM for ${Role}"
+
+    // Convert the Role NSO/RFS/CFS to lower case (to create RPMs with lower case role name for 
+    // historical purposes).  If this is not reqd, remove the ".toLowerCase()" from line below
+    def lcRole = Role.toLowerCase()
+
+    // Create the package versions file from the packages YAML file (alpha-sorts and extracts & adds package versions from XML files)
+    pkgVersion = version_file_gen(Role, releaseNum, "${Role}/packages")
+
+    // Create the folders on an NSO container, from which the RPM will be generated.
+    exec_cmd("docker exec -i nso_container_1_${buildIDstr} /bin/bash -c \"mkdir -p /tmp/cisco/${Role}/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}\"")
+
+    // (re)Create a local folder as the packages tar file source, then copy the passed container's 
+    // packages folder to it 
+    def localSource = "${packageName}-${lcRole}-${pkgVersion}"     // == something like: "robot-rfs-2.1"
+    exec_cmd("rm -rf ${localSource} && mkdir -p ${localSource}")
+    exec_cmd("docker cp ${containerId}${buildIDstr}:${runDir}/packages ${localSource}")
+
+    // Copy the contents of the post-deploy config folder, along with the the package versions file, to the tar file source folder
+    exec_cmd("mkdir -p ${localSource}/${nsoPostDeployFolder}")
+    if ( fileExists("${Role}/${nsoPostDeployFolder}/") ) {
+        // The post-deploy folder exists, list all the files in it and copy each one
+        def listOfFiles = exec_cmd("ls ${Role}/${nsoPostDeployFolder}").split()
+        for(file in listOfFiles) {
+            exec_cmd("cp -f ${Role}/${nsoPostDeployFolder}/${file} ${localSource}/${nsoPostDeployFolder}/ ")
+        }
+    }
+    exec_cmd("cp -f packageVersions${Role}.yml ${localSource}/${nsoPostDeployFolder}/")
+
+    // Create the tar ball of compiled packages for packaging into the RPM
+    exec_cmd("tar -cvf ${localSource}.tar.gz ${localSource}")
+    exec_cmd("docker cp ${localSource}.tar.gz nso_container_1_${buildIDstr}:/tmp/cisco/${Role}/SOURCES/")
+
+    // Create the RPM spec file locally and then copy it to the NSO container/SPECS folder
+    exec_cmd("rm -rf spec/${Role} && mkdir -p spec/${Role}")
+    rpm_spec_gen(Role, "${packageName}-${lcRole}", pkgVersion, releaseNum, "${localSource}/packages", "spec/${Role}/${packageName}-${lcRole}.spec")
+    exec_cmd("docker cp \"spec/${Role}/${packageName}-${lcRole}.spec\" nso_container_1_${buildIDstr}:/tmp/cisco/${Role}/SPECS/${lcRole}.spec")
+    exec_cmd("cat spec/${Role}/${packageName}-${lcRole}.spec", "${Role} RPM Build Spec file: \n")
+
+    // Based on the NSO Docker image: ensure that Cisco user/group exists (ignore errors if already created).
+    // Then set correct ownership of all the RPM files
+    if ( newDkrImageVer ){
+        exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c \"useradd cisco || true\"")
+        exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c \"chown -R cisco:cisco /tmp/cisco/${Role}\"")
+    } else {
+        exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c \"sudo useradd cisco || true\"")
+        exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c \"sudo chown -R cisco:cisco /tmp/cisco/${Role}\"")
+    }
+    debug_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c \"ls -al /tmp/cisco/${Role}\"")
+
+    // Build/package the RPM from the tarball created above & then copy the RPM back to a folder in the local workspace
+    exec_cmd("docker exec -i -u cisco nso_container_1_${buildIDstr} /bin/bash -c \"rpmbuild --define '_topdir /tmp/cisco/${Role}' -ba /tmp/cisco/${Role}/SPECS/${lcRole}.spec && ls -lR /tmp/cisco/${Role}/RPMS \"")
+    exec_cmd("docker cp  nso_container_1_${buildIDstr}:/tmp/cisco/${Role}/RPMS/ ${WORKSPACE}/rpm")
+
+/*    //@@@ DEBUG ONLY: Uncomment this block to verify good RPM creation
+    debug_cmd("ls -lR ${WORKSPACE}/rpm")
+    debug_cmd("rpm -qlp ${WORKSPACE}/rpm/RPMS/noarch/${localSource}-${releaseNum}.noarch.rpm > /tmp/listrpm.txt")
+    debug_cmd("head -40 /tmp/listrpm.txt && rm -rf /tmp/listrpm.txt", "Dump the first page of files from the RPM...\n")
+// */
+
+    // ALSO: Create a history file containing the concatenated change history files for all the packages
+    process_change_histories(pkgVersion, packageName, "${Role}", "packageVersions${Role}.yml", "${WORKSPACE}/changesHistory${Role}-${pkgVersion}.txt")
+
+    return pkgVersion
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to generate test result block for status email
+//-------------------------------------------------------------------------------------------------
+
+def generateTestResults(testcaseBranch, totalTestTime){
+
+    def curlResult = ""
+    def CXTAdata = [:]
+    def CXTAResults = null
+    def testText = ""
+    def testSummary = ",,,"
+
+    // Set up test result counts string per the current result using curl command
+    withCredentials([usernameColonPassword(credentialsId: credentialsId, variable: 'USERPASS')]) {
+        curlResult = exec_cmd("curl -X GET -u ${USERPASS} -s -w '\\n%{http_code}' '${env.BUILD_URL}robot/api/json' ", "CXTA Results from Curl:\n")
+    }
+
+    // Break out the returned results
+    CXTAdata['status'] = curlResult.split('\n')[-1]
+    CXTAdata['content'] = curlResult.split('\n')[0]
+
+    // If the result was success, then break out the test count/data fields
+    if ( CXTAdata.status == '200' ){
+       CXTAResults = readJSON text: CXTAdata.content
+
+        // Set up the test text block
+        testText = """
+            Test cases pulled from branch '<b>${testcaseBranch}</b>'<br>
+            <br>
+            &emsp;The regression test stage took <b>${totalTestTime}</b> to execute.<br>
+            &emsp;-> of the <b>${CXTAResults['overallTotal']}</b> tests executed, <b>${CXTAResults['overallPassed']}</b> tests passed and <b>${CXTAResults['overallFailed']}</b> tests failed (=pass rate of <b>${CXTAResults['passPercentage']}%</b>)<br>
+            &emsp;-> for further detail, see the test results log at:<br>
+            &emsp;&emsp;&emsp; ${env.BUILD_URL}robot/report/log.html<br>
+            """.replaceFirst("\n","").stripIndent()
+
+        testSummary = "${CXTAResults['overallTotal']},${CXTAResults['overallPassed']},${CXTAResults['overallFailed']},${CXTAResults['passPercentage']}%"
+    }
+
+    return [testText, testSummary]
+}
+
+//-------------------------------------------------------------------------------------------------
+//      Function to clean up by disconnecting from and deleting all created containers
+//-------------------------------------------------------------------------------------------------
+
+def delete_containers(cxta_network, buildIDstr, dockersCreated) {
+
+    if ( dockersCreated ) {
+        sh "docker network disconnect ${cxta_network} nso_container_1_${buildIDstr} || true"
+//        sh "docker network disconnect ${cxta_network} nso_container_2_${buildIDstr} || true"
+//        sh "docker network disconnect ${cxta_network} nso_container_3_${buildIDstr} || true"
+        sh "docker network disconnect ${cxta_network} cxta_container_${buildIDstr} || true"
+        sh "docker rm --force nso_container_1_${buildIDstr} || true"
+//        sh "docker rm --force nso_container_2_${buildIDstr} || true"
+//        sh "docker rm --force nso_container_3_${buildIDstr} || true"
+        sh "docker rm --force cxta_container_${buildIDstr} || true"
+        sh "docker network rm ${cxta_network} || true"
+    }
+
+    // Signal that the dockers no longer exist
+    return false
+}
+
+
+//=================================================================================================
+//=================================================================================================
+//              Main Program
+//=================================================================================================
+//=================================================================================================
+
+// Get the Build Parameters using the master node
+node("master") {
+    try {
+
+//=================================================================================================
+        stage('Retrieve Build Parameters (Standalone NSO)') {
+//=================================================================================================
+
+            // Report the build start time and which Node we are running on
+            echo "Started at : ${startExecTime}, on Server : ${env.NODE_NAME}"
+
+            // Set the release number to be the pipeline start timestamp and build number (in the form: YYMMDD.nnn)
+            releaseNum = startExecTime.format("yyMMdd")+ "." + pipelineNum
+
+            // Get the build cause (trigger) info 
+            bldCause = "${currentBuild.getBuildCauses()}"
+            echo "Build cause : '${bldCause}'"
+
+            // Pull from the local git to get the variables file 
+            def scmVars = checkout scm
+            echo "Current branch = ${scmVars.GIT_BRANCH}"
+
+            // Construct network IPs using random numbers for the middle two octets
+            Random rand = new Random()
+            networkId = "172." + rand.nextInt(254+1) + "." + rand.nextInt(254+1) + "."
+
+            docker_network = "${networkId}0/29"
+//          nso_ipaddress_CFS = networkId + CFS_hostIP
+//          nso_ipaddress_RFS1 = networkId + RFS1_hostIP
+//          nso_ipaddress_RFS2 = networkId + RFS2_hostIP
+            nso_ipaddress_NSO = networkId + NSO_hostIP
+            cxta_ipaddress = networkId + CXTA_hostIP
+
+            // Get the variables file, replacing any tabs with spaces (just in case it's malformed)
+            if ( fileExists("${devVariablesFN}") ) {
+                // If a developer version of the file exists, use that
+                exec_cmd("sed 's/\t/    /g' ./${devVariablesFN} > variables-clean.yml", "Using developer version of the variables file (${devVariablesFN})")
+            } else {
+                // Else no developer version, so use the master (we assume it exists)
+                exec_cmd("sed 's/\t/    /g' ./${variablesFN} > variables-clean.yml", "Using master version of the variables file (${variablesFN})")
+            }
+
+            // Read in the cleaned version of the variables YAML file
+            def vars = readYaml file:"variables-clean.yml";
+
+            // Load all the variables from the file (these also become the defaults for the Jenkins page 'Build with Parameters' form)
+//          cfsBranch = vars.cfsBranch
+//          rfsBranch = vars.rfsBranch
+            nsoBranch = vars.nsoBranch
+            testcaseBranch = vars.testcaseBranch
+            packageName = vars.packageName
+            EMAIL = vars.EMAIL
+            artifactLeafFolder = vars.artifactLeafFolder
+            CXTATimeLimit = vars.getOrDefault("CXTATimeLimit", defCXTATimeLimit)    // default if not present in variables file
+            createRPMs = vars.getOrDefault("createRPMs", true)    // default all flag settings if not present (v incl below v)
+            signRPMs = vars.getOrDefault("signRPMs", true)
+            uploadTestsToCXTM = vars.getOrDefault("uploadTestsToCXTM", false)
+            def allowAutoBuilds = vars.getOrDefault("allowAutoBuilds", false)
+            executeSonarQube = vars.getOrDefault("executeSonarQube", true)
+            executeCXTAtests = vars.getOrDefault("executeCXTAtests", true)
+            createDebugLogs = vars.getOrDefault("createDebugLogs", false)
+            nsoImageVersion = vars.nsoImage
+            cxtaImageVersion = vars.cxtaImage
+            showDebugInfo = vars.getOrDefault("displayDebugInfo", false)
+            echo "Build parameter defaults have been pulled from the variables file"
+            def fullDefEmailList = ["${EMAIL}"] + defEMAILlist
+
+            // Add the Requester's UserID to the default email address list if this is a manual build
+            if ( bldCause.contains("userId") ) {
+                fullDefEmailList = fullDefEmailList + [bldCause.split("userId:")[1].split(",")[0]]
+            }
+
+            // Select a random worker node node to use as a default (by adding it as the first item in the list)
+            defNodeList = [defNodeList[rand.nextInt(defNodeList.size()-1)+1]] + defNodeList
+
+            // Gather the parameters from the Jenkins page 'Build with Parameters' form, using values from the variables file as defaults
+            // Note: this block is executed even for auto-builds, to make sure form is created/updated for future manual builds
+            properties([
+                parameters([
+//                  string(name: 'CFS_Code_Branch', defaultValue: "${cfsBranch}", description: 'Branch where the CFS code will be pulled from'),
+//                  string(name: 'RFS_Code_Branch', defaultValue: "${rfsBranch}", description: 'Branch where the RFS code will be pulled from'),
+                    string(name: 'NSO_Code_Branch', defaultValue: "${nsoBranch}", description: 'Branch where the NSO code will be pulled from'),
+                    string(name: 'Functional_Test_Branch', defaultValue: "${testcaseBranch}", description: 'Branch where the FT tests will be pulled from'),
+                    booleanParam(name: 'Create_and_Upload_RPMs', defaultValue: createRPMs, description: 'Check box: if RPMs are to be created and uploaded to Artifactory'),
+                    booleanParam(name: 'Sign_RPMs', defaultValue: signRPMs, description: 'Check box: if RPMs are to be signed (ignored if RPMs are not created)'),
+                    string(name: 'RPM_Filename_root', defaultValue: "${packageName}", description: 'Text used for root of RPM filename (ignored if RPMs not created)'),
+                    string(name: 'Artifact_Leaf_Folder', defaultValue: "${artifactLeafFolder}", description: 'Name of Artifactory sub-folder (ignored if RPMs not created)'),
+                    choice(name: 'Status_email_address', choices: fullDefEmailList, 
+                           description: 'Choose where status emails are to be sent (if blank, will be sent to requester ONLY)'),
+                    string(name: 'CXTA_Stage_Timeout', defaultValue: "${CXTATimeLimit}", description: 'Enter how many hours to wait for CXTA tests to execute (range: 1 - 8)'),
+                    booleanParam(name: 'Execute_SonarQube', defaultValue: executeSonarQube, description: 'Check box: if a SonarQube scan is to be performed on the code'),
+                    booleanParam(name: 'Execute_CXTA_tests' , defaultValue: executeCXTAtests, description: 'Check box: if CXTA regression tests are to be executed'),
+                    booleanParam(name: 'Create_and_Upload_Debug_Logs', defaultValue: createDebugLogs, description: 'Check box: if log files (for debugging test failures) are to be created and uploaded to Artifactory (ignored if tests are not executed)'),
+                    choice(name: 'Worker_Node', choices: defNodeList, 
+                           description: '[OPTIONAL] Choose a particular server to run this build on')
+                ])
+            ])
+            echo "Build parameter changes have been gathered from Jenkins 'Build with Parameters' form"
+
+            // Abort the build if caused by git commit unless auto builds are allowed.
+            if ( bldCause.contains("BranchIndexingCause") && !allowAutoBuilds ) {
+                currentBuild.result = 'ABORTED'
+                error("*** AUTOMATIC ABORT: Pipeline triggered by git commit, so was terminated ***")
+            }
+
+            // It's a manual build, copy the gathered values from the form into variables for use throughout
+//          cfsBranch = params.CFS_Code_Branch.trim()
+//          rfsBranch = params.RFS_Code_Branch.trim()
+            nsoBranch = params.NSO_Code_Branch.trim()
+            testcaseBranch = params.Functional_Test_Branch.trim()
+            packageName = params.RPM_Filename_root.trim()
+            EMAIL = params.Status_email_address.trim()
+            artifactLeafFolder = params.Artifact_Leaf_Folder.trim()
+            signRPMs = params.Sign_RPMs
+            createRPMs = params.Create_and_Upload_RPMs
+            executeSonarQube = params.Execute_SonarQube
+            executeCXTAtests = params.Execute_CXTA_tests
+            createDebugLogs = params.Create_and_Upload_Debug_Logs
+            worker_node = params.Worker_Node.trim()
+            echo "Build parameters have been set based on Form entries"
+
+            // If email is blank, default it to the Requester's email
+            if ( EMAIL.isEmpty() )
+            {
+                EMAIL = bldCause.split("userId:")[1].split(",")[0]
+            }
+
+            // Format as integer:  If floating, get leading digits; if non-numeric, default to variables file entry. 
+            CXTATimeLimit = params.CXTA_Stage_Timeout.split(/\./)[0].isInteger() ?  (params.CXTA_Stage_Timeout.split(/\./)[0] as int) : vars.getOrDefault('CXTATimeLimit', defCXTATimeLimit)
+
+            // Range check - only allow time limits between 1 and 8 hours
+            if ( CXTATimeLimit > 8 ) { CXTATimeLimit = 8 } else { if ( CXTATimeLimit < 1 ) { CXTATimeLimit = 1 }}
+
+            // Perform settings & overrides based on other 'master' flags
+            uploadRPMsToArtifactory = createRPMs // Publish RPMs only if we have created them
+            if ( !createRPMs ){
+                 signRPMs = false             // OVERRIDE: No need to sign rpms if not creating them 
+            }
+            if ( !executeCXTAtests ){
+                 uploadTestsToCXTM = false    // OVERRIDE: No need to upload tests to CXTM if they are not being executed 
+                 createDebugLogs = false      // OVERRIDE: Don't upload debug logs if tests are not executed 
+            }
+
+            // Get the username of whoever requested (kicked off) the build
+            RequesterID = bldCause.split("userName:")[1].split("\\)")[0] + ")"
+
+            // List the final parameter values
+            def ParamList = """
+                Using the following Build Parameters:
+                    NSO Code Branch is: '${nsoBranch}'
+                    Test Branch is: '${testcaseBranch}'
+                    Create RPMs flag is: '${createRPMs}'
+                    Upload RPMs flag is: '${uploadRPMsToArtifactory}'
+                    Sign RPM flag is: '${signRPMs}'
+                    RPM Filename(s) will be: '${packageName}'[-<node>-<ver#>-${releaseNum}.noarch.rpm]
+                    Artifact folder is: [${artifactURL}${artifactFolder}]'${artifactLeafFolder}'
+                    Email addr to use for Status is: '${EMAIL}'
+                    CXTA Test Stage time limit: '${CXTATimeLimit}' hours
+                    Execute SonarQube scan flag is: '${executeSonarQube}'
+                    Execute CXTA tests flag is: '${executeCXTAtests}'
+                    Create logs for debugging flag is: '${createDebugLogs}'
+                    Upload Tests to CXTM flag is: '${uploadTestsToCXTM}'
+                    Using Explicit Worker Server (if any): '${worker_node}'
+
+                Container IP subnet is: '${docker_network}'
+                Container Build ID string is: '${buildIDstr}'
+                NSO Docker image source: '${nsoImageVersion}'
+                CXTA Docker image source: '${cxtaImageVersion}'
+                Workspace is: '${WORKSPACE}'
+                Requester is: '${RequesterID}'
+                """.replaceFirst("\n","").stripIndent()
+            echo ParamList
+
+            // Check if we got any null branch parameters. If so, Abort
+            if ( 
+//               cfsBranch.isEmpty() ||
+//               rfsBranch.isEmpty() ||
+                 nsoBranch.isEmpty() ||
+                 testcaseBranch.isEmpty() ||
+                 EMAIL.isEmpty() ) 
+            {
+                currentBuild.result = 'ABORTED'
+                error("*** ABORTED: One or more required parameters were blank! ***")
+            }
+
+            // Check if we are creating RPMs and got any null RPM parameters. If so, Abort
+            if ( createRPMs && ( packageName.isEmpty() || artifactLeafFolder.isEmpty() ) )
+            {
+                currentBuild.result = 'ABORTED'
+                error("*** ABORTED: One or more RPM parameter values were blank! ***")
+            }
+
+            // Determine if we're using the new NSO BU NSO Docker image or the older CXTA NSO Docker image
+            newDkrImageVer = true
+            if ( nsoImageVersion.contains("/nso-system-centos7") ) { newDkrImageVer = false }
+        }
+    }
+    catch (error) {
+        echo "***************** Parameter Retrieval Error *****************"
+        echo "Exception: " + error
+
+        // Send error email only to requester
+        RequesterID = bldCause.split("userId:")[1].split(",")[0]
+
+        // Send a failure email out
+        emailext (
+            mimeType: 'text/html',
+            subject: "PREMATURE BUILD FAILURE! BAC NSO Jenkins Pipeline, branch: '${currentBuild.projectName}', pipeline#${pipelineNum}",
+            body: "<br>Build pipeline failed with the following error during initial Parameter Retrieval stage:<br><br>&emsp;${error}",
+            to: "${RequesterID}"
+        )
+        throw error
+    }
+    finally {
+        echo "***************** Parameter Retrieval Complete *****************"
+        deleteDir()
+    }
+}
+//return //@@@
+
+// Switch to the node obtained from the build parameters
+node("${worker_node}") {
+    try {
+
+//=================================================================================================
+        BuildStage = "Checkout code from NSO git branch"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Report the Node we are running on  
+            echo "Using Server : ${env.NODE_NAME}"
+
+            // DEBUG: Display the version of Docker on this Slave node
+            debug_cmd("docker version")
+
+            // Checkout the code from the NSO branch and then obtain the list of packages and NEDs from the contents YAML file
+            checkout_pkg_code(nsoBranch, "NSO") 
+            (NSO_packageList, nedList, nedVerList, nsoPlatformVersionNSO, nsoRelVer) = get_contents_yaml_data("NSO", NSOcontentFName) 
+        }
+
+//=================================================================================================
+        BuildStage = "Create Docker Network & NSO Docker Instances"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Signal that the dockers have been created
+            dockersCreated = true
+
+            // Create Docker network
+            exec_cmd("docker network create --driver bridge --subnet ${docker_network} ${cxta_network}")
+
+            // Create the Docker instance for the NSO, adding the Python version string (for pre/post NSO5.4 versions)
+            create_container("nso_container_1_${buildIDstr}", cxta_network, nso_ipaddress_NSO, "${nsoImageVersion}:'${nsoPlatformVersionNSO}${pyImageSubStr}'")
+
+            // DEBUG: Show the Linux Distro & Version running on the container
+            debug_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c \"cat /etc/issue\"")
+
+            // If we're running an earlier NSO image than 5.4 AND required to Build RPMs by the flag 
+            // from the build parameters, install the rpm & rpm-build packages on the NSO, so we can build
+            // rpms at the end.
+            // [THIS 5.4 TEST MAY BE REMOVED AFTER WE'VE COMPLETELY MIGRATED PAST NSO 5.4]
+            if ( (( nsoVersNum < 54 ) || newDkrImageVer ) && createRPMs ){
+                if ( newDkrImageVer ){
+                    // This is a New BU NSO image - make sure rpm build app is installed for Debian
+                    echo "\n*** Installing rpm & rpm-build packages for Debian on NSO container ***\n"
+                    exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c 'apt-get update && apt-get -y install rpm librpmbuild8 && which rpmbuild'")
+                } else {
+                    // This is a pre 5.4 CXTA NSO image - make sure rpm build app is installed for Centos
+                    echo "\n*** Installing rpm & rpm-build packages for Centos on NSO container ***\n"
+                    exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c 'sudo /usr/bin/yum install -y rpm'")
+                    exec_cmd("docker exec -i nso_container_1_${buildIDstr}  /bin/bash -c 'sudo /usr/bin/yum install -y rpm-build'")
+                }
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Install NEDs on NSO"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // This 'hack' is for EPS non-Cisco NEDs:
+            //  1. Cisco NEDs are in the format <name>-cli-<version> where the tailf site folder structure uses ONLY the /<name>/ part
+            //  2. The function 'install_neds_from_yaml' relies on the fact that the NEDs all contain the "-cli-" string and so 
+            //     splits the NED name from the start of the string before that "-cli-".
+            //  3. The EPS NEDs (Fortinet/Checkpoint/Juniper) do not all follow that standard, so we manually force in the "-cli-"
+            //     string, to allow them to work the same way.  Ugh.
+            exec_cmd("sed 's/-nc-/-cli-/g; s/-gen-/-cli-/g'  ./NSO-contents-clean.yml > NSO-contents-nednames.yml")
+
+            install_neds_from_yaml("NSO-contents-nednames.yml", ["nso_container_1_${buildIDstr}"], credentialsId) 
+        }
+
+//=================================================================================================
+        BuildStage = "Load Default NSO Configs"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Create & load Global and Auth Group configs
+            def XMLdata = '''
+                <devices xmlns="http://tail-f.com/ns/ncs">
+                  <global-settings>
+                    <read-timeout>600</read-timeout>
+                    <write-timeout>600</write-timeout>
+                  </global-settings>
+                  <authgroups>
+                    <group>
+                      <name>default</name>
+                      <umap>
+                        <local-user>admin</local-user>
+                        <remote-name>admin</remote-name>
+                        <remote-password>admin</remote-password>
+                      </umap>
+                      <umap>
+                        <local-user>oper</local-user>
+                        <remote-name>oper</remote-name>
+                        <remote-password>admin</remote-password>
+                      </umap>
+                    </group>
+                  </authgroups>
+                </devices>
+                '''.replaceFirst("\n","").stripIndent()
+
+            nso_load_xml("nso_container_1_${buildIDstr}", "Data", "", "${XMLdata}")
+        }
+
+//=================================================================================================
+        BuildStage = "Install & Compile NSO Service Pkgs & NEDs"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Install the NEDs + all the serv.packages (in that order)
+             install_packages((nedList + NSO_packageList), "NSO", "nso_container_1_", buildIDstr)
+
+            // Now the files are copied & NEDs loaded, load the NSO config settings XML file (if it exists in the git)
+            if ( fileExists("NSO/${nsoPostDeployFolder}/${NSOsettingsFName}") ) {
+                echo "Loading NSO config settings XML file"
+                exec_cmd("cp -f NSO/${nsoPostDeployFolder}/${NSOsettingsFName} .")
+                nso_load_xml("nso_container_1_${buildIDstr}", "File", NSOsettingsFName, "")
+            } else {
+                echo "No NSO config settings XML file found in the git"
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Checkout & Set Up CXTA Test Cases"
+        stage(BuildStage) {
+//=================================================================================================
+
+            gitCheckout(testcaseBranch)
+
+            // Copy all required Python/Perl/bash scripts to workspace
+            exec_cmd("cp cicd/scripts/prepare_dispatcher_json.py .")
+
+            // Only copy the automated tests if testing to be performed per the flag from the build parameters
+            if ( executeCXTAtests ){
+
+                // Copying required YAML files to save them temporarily
+                exec_cmd("cp ${robotFileFolder}/testbed*.yaml .")
+                exec_cmd("cp ${robotFileFolder}/Config.yaml .")
+
+                // Create a working folder to sort and copy the json and robot files into
+                exec_cmd("mkdir -p alltests/${robotFileSubfolder} alltests/${payloadFileSubfolder}")
+
+                // Copy all the json and robot (etc) files from any 'leaf' ServPkg test folders, to merge them into the working
+                // folder (leaf folders created because github permits only a limited number of files in a single folder)
+                dir("${WORKSPACE}/${testFileSubfolder}") {
+
+                    // First move the 'root' test/json and test/robot files into the working folder
+                    exec_cmd("if [ -d ${robotFileSubfolder} ]; then mv -f ${robotFileSubfolder} ../alltests; fi;", "...Moved ${robotFileFolder} folder")
+                    exec_cmd("if [ -d ${payloadFileSubfolder} ]; then mv -f ${payloadFileSubfolder} ../alltests; fi;", "...Moved ${payloadFileFolder} folder")
+                    // DEBUG ONLY:  debug_cmd("ls -lR ../alltests")
+
+                    // Get the list of the remaining subfolders (1 level deep), remove the "./" in front of them, and copy the contents of each to the working folder.
+                    exec_cmd("""for i in `find . -maxdepth 1 -type d |grep -v "^.\$" |sed -e "s/.\\///g"`; do cp -rf \$i/* ../alltests/ ; done;""")
+                }
+
+                // Now delete the fragmented tests folder and rename the merged working folder back to it
+                exec_cmd("rm -rf tests && mv alltests tests")
+                debug_cmd("ls -lR tests")
+
+                // Copy saved YAML files back (in case they were overwritten by 'leaf' folder contents)
+                exec_cmd("cp testbed*.yaml ${robotFileFolder}/")
+                exec_cmd("cp Config.yaml ${robotFileFolder}/Config.yaml")
+
+                // Replace the default IP net with the one created for this build
+                exec_cmd("sed -i 's/172.28.0./${networkId}/g' ${robotFileFolder}/testbed*.yaml")
+
+            //@@@=================
+            //TEMP: Change REST call URIs to RESTCONF URIs in .robot files - do this until all robot files are manually updated
+                if ( nsoVersNum >= 54 ){
+
+                    // For: Service UPDATE/MODIFY/DELETE [PUT/PATCH/DELETE] ("/api/running/casb/services/<serv_name>" -> "/restconf/data/casb:casb/casb:services/<serv_name>:<serv_name>")
+                    exec_cmd("sed -r -i 's|(.*/)(api/running/casb/services/)([^\"]+)(.*)|\\1restconf/data/casb:casb/casb:services/\\3:\\3\\4|' ${robotFileFolder}/*.robot")  //"
+
+                    // For: Service CREATE [POST] ("/api/running/casb/services" -> "/restconf/data/casb:casb/casb:services")
+                    exec_cmd("sed -r -i 's|/api/running/casb/services|/restconf/data/casb:casb/casb:services|g' ${robotFileFolder}/*.robot")
+
+                    // For: Ref Data CREATE/DELETE [POST/DELETE] ("/api/running/casb/reference-data/<service_name>" -> "/restconf/data/casb:casb/casb:reference-data/<serv_name>:<serv_name>")
+                    exec_cmd("sed -r -i 's|(.*/)(api/running/casb/reference-data/)([^\"]+)(.*)|\\1restconf/data/casb:casb/casb:reference-data/\\3:\\3\\4|' ${robotFileFolder}/*.robot")
+
+                    // For: Action CREATE [POST] ("/api/running/casb/actions/_operations/<action_name>" -> "/restconf/data/casb:casb/casb:actions/<action_name>:<action_name>")
+                    exec_cmd("sed -r -i 's|(.*/)(api/running/casb/actions/)([^/]+)(/)([^\"]+)(.*)|\\1restconf/data/casb:casb/casb:actions/\\5:\\5\\6|' ${robotFileFolder}/*.robot")  //"
+
+                } // */
+
+            //TEMP: Remove nx:/ios:/dcs: prefixes in robot and expected diff files
+
+                if ( nsoVersNum >= 54 ){
+
+                    // remove ios prefix
+                    exec_cmd("sed -r -i 's|ios:||g' ${robotFileFolder}/*.robot")
+
+                    // remove nx prefix
+                    exec_cmd("sed -r -i 's|nx:||g' ${robotFileFolder}/*.robot")
+
+                    // remove dcs prefix
+                    exec_cmd("sed -r -i 's|dcs:||g' ${robotFileFolder}/*.robot")
+
+                    // remove ios prefix
+                    exec_cmd("sed -r -i 's|ios:||g' ${payloadFileFolder}/expected/*.txt")
+
+                    // remove nx prefix
+                    exec_cmd("sed -r -i 's|nx:||g' ${payloadFileFolder}/expected/*.txt")
+
+                    // remove dcs prefix
+                    exec_cmd("sed -r -i 's|dcs:||g' ${payloadFileFolder}/expected/*.txt")
+
+                }
+            //@@@================= */
+            }
+            else {
+                echo "***************** No CXTA Tests have been copied since no testing performed (per build parameters flag) *****************"
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Create NetSim Devices"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // NOTE: These steps depend on files created by the 'CXTA tests checkout & set-up' stage, so cannot be performed prior to that
+
+            // Only create NetSim Devices if testing to be performed per the flag from the build parameters
+            if ( executeCXTAtests ){
+
+                // Create all the NetSim devices from generated list
+                create_netsim_devices(buildIDstr, nedList)
+
+                // Execute any pre-config scripts on the NetSim devices just created
+                device_preconfigs(buildIDstr)
+            }
+            else {
+                echo "***************** No NetSim Devices created since no testing performed (per build parameters flag) *****************"
+            }
+        }
+
+        parallel (sonarqube: {
+//=================================================================================================
+            BuildStage = "Execute SonarQube Quality Metrics"
+            stage(BuildStage) {
+//=================================================================================================
+
+                exec_cmd("rm -rf sonarscan && mkdir -p sonarscan && echo \$?")
+
+                if ( executeSonarQube ){
+                    sonar_copy_packages(NSO_packageList, "nso_container_1_", buildIDstr)
+                    def scannerHome = tool 'SONARQUBE_HOME';
+                    sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=cx-spade-sjc-41 -Dsonar.projectName=cx-spade-sjc-41 -Dsonar.projectVersion=${env.BUILD_TAG} -Dsonar.login=646ea8fd9883901a97f4c0a25f3215a676c436c5 -Dsonar.projectBaseDir=${env.workspace}/sonarscan -Dsonar.sources=${env.workspace}/sonarscan -Dsonar.java.binaries=${env.workspace}/sonarscan -Dsonar.c.file.suffixes=- -Dsonar.cpp.file.suffixes=- -Dsonar.objc.file.suffixes=- -Dsonar.working.directory=.sonar -Dsonar.exludedDirs='**/log.html' -Dsonar.host.url=${sonarHostURL}"
+                }
+                else {
+                    echo "***************** No SonarQube scan has been executed (per build parameters flag) *****************"
+                }
+            }
+
+        }, cxta: {
+//=================================================================================================
+            BuildStage = "Execute CXTA tests"
+            stage(BuildStage) {
+//=================================================================================================
+
+                // Only execute the automated tests if required by the flag from the build parameters
+                if ( executeCXTAtests ){
+
+                    // Get the time that the test stage started
+                    Date startTestTime = new Date()
+                    echo "CXTA Testing Started at : ${startTestTime}"
+
+                    // Create CXTA container
+                    cxtaImage = docker.image("${cxtaImageVersion}")
+                    cxtaImage.pull()
+                    cxtaContainer = cxtaImage.run("--name cxta_container_${buildIDstr} --network=${cxta_network} --ip=${cxta_ipaddress}", "tail -f /dev/null")
+                    echo "CXTA Container Name is 'cxta_container_${buildIDstr}'\nCXTA Container ID = '${cxtaContainer.id}'"
+
+                    // Copy the tests onto the CXTA container, run them and publish the results
+                    run_cxta_tests("cxta_container_${buildIDstr}", CXTATimeLimit)
+
+                    // Get the time now and calc how long this test stage took to execute
+                    Date endTestTime = new Date()
+                    long tdelta = endTestTime.getTime() - startTestTime.getTime()
+                    long mS_in_1minute = 1000 * 60
+                    long mS_in_1hour = mS_in_1minute * 60
+                    long elapsedHours = tdelta / mS_in_1hour
+                    tdelta = ( tdelta % mS_in_1hour ) + ( mS_in_1minute/2 ) // get remainder and add rounding amount
+                    long elapsedMinutes = tdelta / mS_in_1minute
+                    totalTestTime = "${elapsedHours} hr ${elapsedMinutes} min"
+                    // if ( elapsedHours > 0 ) { totalTestTime = "${elapsedHours} hr ${elapsedMinutes} min" } else { totalTestTime = "${elapsedMinutes} min" }
+                    echo "CXTA Testing Completed at : ${endTestTime}, taking ${totalTestTime}"
+
+                    echo "####\n####  List pre/post config files with detailed timestamps --> for debug purposes, indicates time taken for each test\n####"
+                    debug_cmd("docker exec -i cxta_container_${buildIDstr} /bin/bash -c 'cd ${cxtaRootFolder}/${payloadFileFolder}/device_configs && ls -ltr --time-style=\"+%Y-%m-%d %H:%M:%S\"'")
+                }
+                else {
+                    echo "***************** No CXTA Tests have been executed (per build parameters flag) *****************"
+                }
+            }
+        } )
+
+//=================================================================================================
+        BuildStage = "Publish Test Results"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Clean/create testcase folders, even if not running tests, as they are expected to be present during Artifactory upload.
+            exec_cmd("rm -rf testresults/ testcases/;mkdir -p testresults/ testcases/;")
+
+            // If required, tar the logs folder on the NSO and copy it back to the Workspace testresults folder, along with the test results
+            if ( createDebugLogs ){
+                // FOR DEBUG PURPOSES: tar the logs folder on the NSO and copy it back to the Workspace testresults folder
+                exec_cmd("docker exec -i nso_container_1_${buildIDstr} /bin/bash -c 'cd /log && tar -cvf ncs_logs.tar.gz *'")
+                exec_cmd("docker cp nso_container_1_${buildIDstr}:/log/ncs_logs.tar.gz  testresults/ncs_logs_${releaseNum}.tar.gz")
+            }
+
+            // Only tar the automated test results if required by the flag from the build parameters
+            if ( executeCXTAtests ){
+                exec_cmd("docker exec -i cxta_container_${buildIDstr}  /bin/bash -c \" cd ${cxtaRootFolder}/ && tar cvzf cxta-tests-${releaseNum}.tar.gz tests \"")
+                exec_cmd("docker cp cxta_container_${buildIDstr}:${cxtaRootFolder}/cxta-tests-${releaseNum}.tar.gz  testcases/")
+                exec_cmd("docker exec -i cxta_container_${buildIDstr}  /bin/bash -c \" cd ${testFolder} && tar cvzf cxta-report-${releaseNum}.tar.gz output.xml log.html report.html \"")
+                exec_cmd("docker cp cxta_container_${buildIDstr}:${testFolder}/cxta-report-${releaseNum}.tar.gz  testresults/")
+                exec_cmd("rm -f output.xml")
+                exec_cmd("docker cp cxta_container_${buildIDstr}:${testFolder}/output.xml .")
+                debug_cmd("ls -l testresults/;ls -l testcases/ ")
+            }
+            else {
+                echo "***************** No CXTA Tests have been executed/published (per build parameters flag) *****************"
+            }
+
+            echo "currentBuild.currentResult ${currentBuild.currentResult}"
+        }
+
+//=================================================================================================
+        BuildStage = "Update CXTA Job files on CXTM"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Only upload the tests to CXTM if required by the flag from the build parameters
+            if ( uploadTestsToCXTM ){
+                def testsuites_arr_res = """ls -1 ./${robotFileFolder}/ | awk '/.robot\$/{print $NF}' | cut -d '.' -f1 """
+                echo "${testsuites_arr_res}"
+                def testsuites_arr = termSh(cmd: "${testsuites_arr_res}")
+                echo "${testsuites_arr}"
+                TEST_SUITES_ARR = testsuites_arr.tokenize('\n')
+                echo "${TEST_SUITES_ARR}"
+                TEST_SUITES_ARR.removeAll{it == 0}
+                echo "${TEST_SUITES_ARR}"
+                TEST_SUITES_ARR.each {
+                    if ( it != 0 ) {
+                        def test_suites = it
+                        echo "==========================================================="
+                        echo "${test_suites}"
+                        def test_phase = "nso-${packageName}"
+                        def upload_testsuite_cxtm = exec_cmd("""/bin/bash -c ' curl -X POST "http://apjc-bac-slv01:8080/cxtm/testcases/create_from_robotfile?project=Robot-Services&phase=${test_phase}" -F file=@${env.workspace}/${robotFileFolder}/${test_suites}.robot'""")
+                        echo "Uploading_testsuite_cxtm==>${upload_testsuite_cxtm}"
+                    }
+                }
+
+                def update_cxta_result_cxtm = exec_cmd("""/bin/bash -c 'curl -X PUT http://apjc-bac-slv01:8080/cxtm/testcases/updaterastaresults -F file=@${env.workspace}/output.xml -F suites=${testsuites_arr}'""")
+                echo "Updating Test Result==>${update_cxta_result_cxtm}"
+
+                TEST_SUITES_ARR.each {
+                    if ( it != 0 ) {
+                        def test_suites = it
+                        def update_job_files_cxtm = exec_cmd("""/bin/bash -c 'curl -X POST http://apjc-bac-slv01:8080/cxtm/jobfiles/create_from_robotfile?project=Robot-Services -F file=@${env.workspace}/${robotFileFolder}/${test_suites}.robot'""")
+                        echo "Updating Job Files==>${update_job_files_cxtm}"
+                    }
+                }
+            }
+            else {
+                  echo "***************** No CXTM Test upload required (per build parameters flag) *****************"
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Build RPMs"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Only Build RPMs if required by the flag from the build parameters
+            if ( createRPMs ){
+
+                // Update release number by prepending Major and Minor version of NSO platform release number
+                def tmpNSOVers = nsoPlatformVersionCFS.split(/\./)
+                releaseNum = "${tmpNSOVers[0]}.${tmpNSOVers[1]}.${releaseNum}"
+
+                // Create the local folder required for storing the RPMs
+                exec_cmd("mkdir -p ${WORKSPACE}/rpm;")
+
+                // Generate the NSO RPM and copy back to the local folder above
+                packageVersion = generate_rpm(releaseNum, packageName, "NSO", "nso_container_1_", buildIDstr)
+
+                // Now tar/gz the Change history file that was generated
+                exec_cmd("tar cvzf changesHistory-${packageVersion}.tar.gz changesHistory*.txt; rm -f changesHistory*.txt")
+            }
+            else {
+                echo "***************** No RPM builds required (per build parameters flag) *****************"
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Sign RPMs"
+        stage(BuildStage) {
+//=================================================================================================
+
+            // Only sign the RPMs if required by the flag from the build parameters
+            if ( signRPMs ){
+
+                // Copy signing script file and swims ticket to be sourced in the rpmsign conf directory
+                // NOTE: This assumes that the 'testcaseBranch' was the last branch checked-out from git 
+                exec_cmd("mkdir -p rpmsign/conf/")
+                exec_cmd("cp ${WORKSPACE}/cicd/scripts/setup-rel.sh rpmsign/conf/")
+                exec_cmd("cp ${WORKSPACE}/cicd/conf/swims_ticket rpmsign/conf/")
+
+                // Sign the rpm
+                exec_cmd("docker run --rm -v${WORKSPACE}/rpm/RPMS/noarch/:/tmp/rpms -v ${WORKSPACE}/rpmsign/conf/:/opt/rpmsign/conf/ -t ${signingDocker} bin/rpm_sign_rel /tmp/rpms/${packageName}-nso-${packageVersion}-${releaseNum}.noarch.rpm ")
+
+                // Get rpm signature information
+                exec_cmd("docker run --rm -v${WORKSPACE}/rpm/RPMS/noarch/:/tmp/rpms -v ${WORKSPACE}/rpmsign/conf/:/opt/rpmsign/conf/ -t ${signingDocker} rpm -qpi /tmp/rpms/${packageName}-nso-${packageVersion}-${releaseNum}.noarch.rpm")
+
+                // Get rpm signing status
+                def signStatusNSO = exec_cmd("docker run --rm -v${WORKSPACE}/rpm/RPMS/noarch/:/tmp/rpms -v ${WORKSPACE}/rpmsign/conf/:/opt/rpmsign/conf/ -t ${signingDocker} rpm -checksig /tmp/rpms/${packageName}-nso-${packageVersion}-${releaseNum}.noarch.rpm")
+
+                echo "NSO signing status is: \n${signStatusNSO}"
+
+                // Verify the RPM is signed correctly
+                if ( signStatusNSO.toLowerCase().contains("pgp") ) {
+                    echo "NSO package has been signed"
+                }
+                else {
+                    currentBuild.result = 'ABORTED'
+                    error("*** ABORTED: Signing error, RPM signing FAILED! Check Swims_ticket is current/valid ***")
+                }
+            }
+            else {
+                echo "***************** No RPM signing required (per build parameters flag) *****************"
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Publish Release to Artifactory"
+        stage(BuildStage) {
+//=================================================================================================
+
+            artifactDir = "${artifactFolder}${artifactLeafFolder}/${packageVersion}-${releaseNum}"
+            echo  "${artifactDir}"
+
+            // Only upload RPMs into Internal artifactory if required by the flag from the build parameters
+            if ( uploadRPMsToArtifactory || createDebugLogs ){
+                echo "Publishing in artifactory"
+
+                def server = Artifactory.newServer url: "${artifactURL}", username: "${artifactUser}", password:"${artifactPasswd}"
+                def uploadSpec = """{
+                  "files": [
+                    {
+                      "pattern": "rpm/RPMS/noarch/*.rpm",
+                      "target": "${artifactDir}/",
+                      "props": "p1=v1;p2=v2"
+                    } ,
+                    {
+                      "pattern": "testresults/*.tar.gz",
+                      "target": "${artifactDir}/",
+                      "props": "p1=v1;p2=v2"
+                    } ,
+                    {
+                      "pattern": "testcases/*.tar.gz",
+                      "target": "${artifactDir}/",
+                      "props": "p1=v1;p2=v2"
+                    } ,
+                    {
+                      "pattern": "packageVersions*.*",
+                      "target": "${artifactDir}/",
+                      "props": "p1=v1;p2=v2"
+                    } ,
+                    {
+                      "pattern": "changesHistory*.*",
+                      "target": "${artifactDir}/",
+                      "props": "p1=v1;p2=v2"
+                    } ,
+                    {
+                      "pattern": "NSO/${nsoMockDevFolder}/*.*",
+                      "target": "${artifactDir}/nso-${nsoMockDevFolder}/",
+                      "props": "p1=v1;p2=v2"
+                    }
+                  ]
+                }""" // */
+                echo "Artifactory Upload Spec: ${uploadSpec}"
+                def buildInfo = server.upload spec: uploadSpec
+                server.publishBuildInfo buildInfo  //@@@ comment this line to not actually send to Artifactory
+            }
+            else {
+                  echo "***************** No RPM publish to Artifactory required (per build parameters flag) *****************"
+            }
+        }
+
+//=================================================================================================
+        BuildStage = "Email Final Status"
+        stage(BuildStage) {
+//=================================================================================================*/
+
+            // Get the pipeline duration so far
+            def endExecTime = currentBuild.durationString.minus(" and counting")
+
+            // Create Test result text, based on whether testing was performed or not
+            def testSubText = ""
+            def testSummary = ""
+            def statusStr = ""
+            if ( executeCXTAtests ){
+
+                // Set up status string per the current result
+                switch(currentBuild.currentResult) { 
+                    case "FAILURE": statusStr = "- less than ${CXTAunstableThreshold}% tests passed."; break;
+                    case "UNSTABLE": statusStr = "- greater than ${CXTAunstableThreshold}%, but less than ${CXTApassThreshold}%, tests passed."; break;
+                    case "SUCCESS": statusStr = "- greater or equal to ${CXTApassThreshold}% tests passed."; break;
+                    default: statusStr = ""
+                } 
+
+                // Set up the test results text block
+                (testSubText, testSummary) = generateTestResults(testcaseBranch, totalTestTime)
+            }
+            else {
+                statusStr = "- with no CXTA regression tests performed"
+            }
+
+            // Create RPM text, based on whether RPMs have been published or not
+            def rpmSubText = "RPMS have been created and published to:<br>&emsp;&emsp; ${artifactURL}${artifactDir}/"
+            if ( !uploadRPMsToArtifactory ){
+                rpmSubText = "RPMS have not been created or published (per build parameters flag)"
+
+                if ( createDebugLogs ){
+                    rpmSubText = "RPMS have not been created, but Debug NCS log files have been published to:<br>&emsp;&emsp; ${artifactURL}${artifactDir}/"
+                }
+            }
+
+            // Create SonarQube text, based on whether SQ checks were made or not
+            def sqSubText = "SonarQube Code Inspection results are available at:<br>&emsp;&emsp; ${sonarHostURL}${sonarDashbd}"
+            if ( !executeSonarQube ){ sqSubText = "SonarQube Code Inspection was not performed (per build parameters flag)" }
+
+            // Create appropriate lines for body of email in HTML for formatting (strip indent spaces so text is left-aligned)
+            def BodyString = """
+                <html>
+                Jenkins Build Pipeline completed with status: <b>${currentBuild.currentResult}</b> <i>${statusStr}</i><br>
+                <br>
+                Code for NSO pulled from branch '<b>${nsoBranch}</b>'<br>
+                ${testSubText}
+                <br>
+                ${sqSubText}<br>
+                <br>
+                ${rpmSubText}<br>
+                <br>
+                Build pipeline was started by ${RequesterID} at ${startExecTime.format("HH:mm:ss z, 'on' EEE MMM d, yyyy")} -- and took: <b>${endExecTime}</b>, on server: <b>${env.NODE_NAME}</b><br><br><br>
+                """.replaceFirst("\n","").stripIndent()
+
+            //--------------------------------------------------------------------------------------------
+            // Create appropriate lines for email data mining/processing, BUT ONLY if tests were executed
+            if ( executeCXTAtests ){
+                // Pre-set time values
+                totalTestTime=totalTestTime.replaceFirst(" hr ",":").replaceFirst(" min",":00")
+                endExecTime=endExecTime.replaceFirst(" hr ",":").replaceFirst(" min",":00")
+                def rpmName = ""
+                if ( createRPMs ) { rpmName = "${packageName}-xxx-${packageVersion}-${releaseNum}.noarch.rpm" }
+                Date CompletnTime = new Date()
+
+                // Create data mining string, in format:
+                //   Pipeline_Completion_date/time,CFS/NSO_Git,[RFS_Git],FT_Git,Test_Execn_Time,#Tests_Exec,#Tests_Passed, ...
+                //     #Tests_Failed,Pass%,Build_Start_Time,Build_Execn_Time,Worker_Node,[RPM_names]
+                def MRstring = """
+                    ${CompletnTime.format("yyyy-MM-dd,HH:mm:ss")},
+                    ${nsoBranch},<N/A>,${testcaseBranch},${currentBuild.projectName},${pipelineNum},
+                    ${totalTestTime},${testSummary},${startExecTime.format("yyyy-MM-dd,HH:mm:ss")},${endExecTime},
+                    ${env.NODE_NAME},${rpmName}
+                    """.replaceAll("\n","").stripIndent()
+
+                BodyString = BodyString + """
+                    <i>------------------------------------------------------------ Machine-Readable Summary ------------------------------------------------------------<br>
+                    MRDATA:${MRstring}</i><br>
+                    <br> <br>
+                    """.replaceFirst("\n","").stripIndent()
+            }
+            //--------------------------------------------------------------------------------------------
+
+            // Now the email body has been created, send the email out
+            emailext (
+                //attachmentsPattern: 'testresults/test-report*.gz',
+                mimeType: 'text/html',
+                subject: "${currentBuild.currentResult}: BAC NSO Jenkins Pipeline BUILD COMPLETE. Branch: '${currentBuild.projectName}', pipeline#${pipelineNum}",
+                body: "${BodyString}",
+                to: "$EMAIL"
+            )
+
+            echo "Completion email sent to: ${EMAIL}, with subject: ${currentBuild.currentResult}: BAC_NSO Jenkins Pipeline BUILD COMPLETE. Branch: '${currentBuild.projectName}', pipeline#${pipelineNum}"
+            echo "Email content:\n\n${BodyString}\n"
+            echo "Test results log is at: ${env.BUILD_URL}robot/report/log.html"
+        }
+    }
+
+//=================================================================================================
+//      Final Cleanup
+//=================================================================================================
+
+    catch (error) {
+        echo "Exception: " + error
+        echo "***************** Error Detected in Main Body *****************"
+        dockersCreated = delete_containers(cxta_network, buildIDstr, dockersCreated)
+
+        // Create appropriate lines for body of failure email
+        def BodyString = """
+            <html>
+            Jenkins Build Pipeline <b>PREMATURE BUILD FAILURE & PIPELINE EXIT!</b><br><br>
+            Code for NSO pulled from branch '<b>${nsoBranch}</b>'<br><br>
+            Build pipeline was started by ${RequesterID} but failed in stage '<b>${BuildStage}</b>', with the following error:<br><br>
+            &emsp;&emsp;<b>${error}</b><br><br>
+            For further detail, see the pipeline console log at:<br>
+            &emsp;&emsp;&emsp; ${env.BUILD_URL}consoleFull<br>
+            """.replaceFirst("\n","").stripIndent()
+
+        // Send the failure email out
+        emailext (
+            //attachmentsPattern: 'testresults/test-report*.gz',
+            mimeType: 'text/html',
+            subject: "PREMATURE BUILD FAILURE! BAC NSO Jenkins Pipeline, branch: '${currentBuild.projectName}', pipeline#${pipelineNum}",
+            body: "${BodyString}",
+            to: "$EMAIL"
+        )
+
+        throw error
+    }
+    finally {
+        //if ( params.stopContainerOnExit == true ) {
+        echo "***************** Finished. Cleaning up. *****************"
+        dockersCreated = delete_containers(cxta_network, buildIDstr, dockersCreated)
+        //}
+
+        deleteDir()
+        build job: '../../../Template-Jobs/PostBuildAction', parameters: [string(name: 'JobName', value: env.JOB_NAME)], wait: false
+        build job: '../../../Template-Jobs/PostTestResultsAction', parameters: [string(name: 'JobName', value: env.JOB_NAME),string(name: 'releaseNumber', value: pipelineNum)], wait: false
+        echo "Pipeline execution took: " + currentBuild.durationString.minus(" and counting")
+    }
+}
